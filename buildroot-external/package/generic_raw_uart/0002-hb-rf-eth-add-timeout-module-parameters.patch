@@ -1,0 +1,133 @@
+hb_rf_eth: add timeout module parameters and robustness fixes
+
+Allow deployments with routed or slightly higher-latency network paths to tune
+the HB-RF-ETH connection watchdog and reconnect handshake timeout without
+changing the default behavior.
+
+Also fix a reconnect-path receive buffer leak, add missing allocation checks,
+return the correct error when generic_raw_uart_probe() fails, and only log
+connect sysfs file creation failures when an error actually occurred.
+
+Upstream: Pending
+Signed-off-by: An Zimber <anzimber@users.noreply.github.com>
+
+diff --git kernel/hb_rf_eth.c kernel/hb_rf_eth.c
+index 9c7e51d..df7d248 100644
+--- a/kernel/hb_rf_eth.c
++++ b/kernel/hb_rf_eth.c
+@@ -47,6 +47,8 @@
+ #define BUFFER_SIZE 1500
+
+ static short int autoreconnect = 1;
++static unsigned int connect_timeout_ms = 50;
++static unsigned int rx_timeout_ms = 5000;
+
+ static struct gpio_chip gc = {0};
+ static spinlock_t gpio_lock;
+@@ -269,7 +271,13 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
+
+     err = -ETIMEDOUT;
+     recv_buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
+-    timeout = jiffies + msecs_to_jiffies(50);
++    if (recv_buffer == NULL)
++    {
++      sock_release(sock);
++      return -ENOMEM;
++    }
++
++    timeout = jiffies + msecs_to_jiffies(connect_timeout_ms);
+     while (time_before(jiffies, timeout))
+     {
+       len = hb_rf_eth_recv_packet(sock, recv_buffer, BUFFER_SIZE);
+@@ -287,11 +295,13 @@ static int hb_rf_eth_try_connect(char endpointIdentifier)
+     if (err)
+     {
+       dev_err(dev, "Timeout occured while connecting to %pI4\n", &remote.sin_addr);
++      kfree(recv_buffer);
+       sock_release(sock);
+       return err;
+     }
+   }
+
++  kfree(recv_buffer);
+   _sock = sock;
+   sysfs_notify(&dev->kobj, NULL, "is_connected");
+   generic_raw_uart_set_connection_state(raw_uart, true);
+@@ -368,6 +378,8 @@ static int hb_rf_eth_recv_threadproc(void *data)
+   hb_rf_eth_set_high_prio();
+
+   buffer = kmalloc(BUFFER_SIZE, GFP_KERNEL);
++  if (buffer == NULL)
++    return -ENOMEM;
+
+   while (!kthread_should_stop())
+   {
+@@ -393,9 +405,9 @@ static int hb_rf_eth_recv_threadproc(void *data)
+       }
+     }
+
+-    if (time_after(jiffies, lastReceivedKeepAlive + msecs_to_jiffies(5000)))
++    if (time_after(jiffies, lastReceivedKeepAlive + msecs_to_jiffies(rx_timeout_ms)))
+     {
+-      dev_err(dev, "Did not receive any packet in the last 5 seconds, terminating connection.\n");
++      dev_err(dev, "Did not receive any packet in the last %u ms, terminating connection.\n", rx_timeout_ms);
+       sock_release(_sock);
+       _sock = NULL;
+       sysfs_notify(&dev->kobj, NULL, "is_connected");
+@@ -743,7 +755,17 @@ static int __init hb_rf_eth_init(void)
+   init_waitqueue_head(&queue_wq);
+
+   send_msg_queue = kzalloc(sizeof(struct send_msg_queue_t), GFP_KERNEL);
++  if (send_msg_queue == NULL)
++  {
++    err = -ENOMEM;
++    goto failed_queue_alloc;
++  }
+   send_msg_queue->entries = kcalloc(QUEUE_LENGTH, sizeof(struct send_msg_queue_entry), GFP_KERNEL);
++  if (send_msg_queue->entries == NULL)
++  {
++    err = -ENOMEM;
++    goto failed_queue_entries_alloc;
++  }
+
+   class = class_create(THIS_MODULE, "hb-rf-eth");
+   if (IS_ERR(class))
+@@ -791,7 +813,7 @@ static int __init hb_rf_eth_init(void)
+   raw_uart = generic_raw_uart_probe(dev, &hb_rf_eth, NULL);
+   if (IS_ERR(raw_uart))
+   {
+-    err = PTR_ERR(dev);
++    err = PTR_ERR(raw_uart);
+     goto failed_raw_uart_probe;
+   }
+
+@@ -802,6 +824,7 @@ static int __init hb_rf_eth_init(void)
+     dev_info(dev, "failed creating is_connected sysfs file: %d\n", err);
+
+   err = sysfs_create_file(&dev->kobj, &dev_attr_connect.attr);
++  if (err)
+     dev_info(dev, "failed creating connect sysfs file: %d\n", err);
+
+   return 0;
+@@ -812,6 +835,9 @@ failed_gc_create:
+   device_destroy(class, 0);
+ failed_dev_create:
+   class_destroy(class);
++failed_queue_entries_alloc:
++  kfree(send_msg_queue);
++failed_queue_alloc:
+ failed_class_create:
+   return err;
+ }
+@@ -857,6 +883,12 @@ MODULE_PARM_DESC(connect, "Deprecated! Use /sys/class/hb-rf-eth/hb-rf-eth/connec
+ module_param(autoreconnect, short, S_IRUSR | S_IWUSR);
+ MODULE_PARM_DESC(autoreconnect, "If enabled, the module will automatically try to reconnect");
+
++module_param(connect_timeout_ms, uint, S_IRUSR | S_IWUSR);
++MODULE_PARM_DESC(connect_timeout_ms, "Timeout in ms for the HB-RF-ETH UDP connect handshake");
++
++module_param(rx_timeout_ms, uint, S_IRUSR | S_IWUSR);
++MODULE_PARM_DESC(rx_timeout_ms, "Timeout in ms before reconnecting when no HB-RF-ETH packets are received");
++
+ module_init(hb_rf_eth_init);
+ module_exit(hb_rf_eth_exit);
