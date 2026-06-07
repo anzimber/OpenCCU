@@ -1,0 +1,64 @@
+hb_rf_eth: add optional radio reset after automatic reconnects
+
+Automatic reconnect restores the UDP socket, but it does not run the same
+radio reset that is sent after the initial connection. Add a tunable cleanup
+mode so deployments can reset the radio module after a configurable number of
+automatic reconnects without restarting the whole CCU.
+
+The default keeps the existing behavior unchanged.
+
+Upstream: Pending
+Signed-off-by: An Zimber <anzimber@users.noreply.github.com>
+
+diff --git kernel/hb_rf_eth.c kernel/hb_rf_eth.c
+index df7d248..f7e7e8b 100644
+--- a/kernel/hb_rf_eth.c
++++ b/kernel/hb_rf_eth.c
+@@ -49,6 +49,7 @@
+ static short int autoreconnect = 1;
+ static unsigned int connect_timeout_ms = 50;
+ static unsigned int rx_timeout_ms = 5000;
++static unsigned int reconnect_reset_after = 0;
+ 
+ static struct gpio_chip gc = {0};
+ static spinlock_t gpio_lock;
+@@ -355,6 +356,8 @@ static bool is_queue_filled(int *head, int *tail)
+   return CIRC_CNT(*head, *tail, QUEUE_LENGTH) >= 1;
+ }
+ 
++static void hb_rf_eth_send_reset(void);
++
+ static int hb_rf_eth_send_threadproc(void *data)
+ {
+   struct send_msg_queue_entry *entry;
+@@ -377,6 +380,7 @@ static int hb_rf_eth_recv_threadproc(void *data)
+   int len;
+   int i;
+   unsigned long lastReceivedKeepAlive = jiffies;
++  unsigned int reconnectsSinceReset = 0;
+ 
+   hb_rf_eth_set_high_prio();
+ 
+@@ -422,6 +426,13 @@ static int hb_rf_eth_recv_threadproc(void *data)
+           if (hb_rf_eth_try_connect(currentEndpointIdentifier) == 0)
+           {
+             lastReceivedKeepAlive = jiffies;
++            reconnectsSinceReset++;
++            if (reconnect_reset_after > 0 && reconnectsSinceReset >= reconnect_reset_after)
++            {
++              dev_info(dev, "Resetting radio module after %u automatic reconnects\n", reconnectsSinceReset);
++              hb_rf_eth_send_reset();
++              reconnectsSinceReset = 0;
++            }
+             dev_info(dev, "Successfully connected to %pI4\n", &remote.sin_addr);
+             break;
+           }
+@@ -889,5 +900,7 @@
+ module_param(rx_timeout_ms, uint, S_IRUSR | S_IWUSR);
+ MODULE_PARM_DESC(rx_timeout_ms, "Timeout in ms before reconnecting when no HB-RF-ETH packets are received");
+-
++module_param(reconnect_reset_after, uint, S_IRUSR | S_IWUSR);
++MODULE_PARM_DESC(reconnect_reset_after, "Reset the HB-RF-ETH radio module after this many automatic reconnects, 0 disables cleanup reset");
++
+ module_init(hb_rf_eth_init);
+ module_exit(hb_rf_eth_exit);
